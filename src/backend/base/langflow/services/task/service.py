@@ -25,6 +25,8 @@ class TaskService(Service):
         return self.backend.name
 
     def get_backend(self) -> TaskBackend:
+        if self.settings_service.settings.use_celery:
+            return CeleryBackend()
         return AnyIOBackend()
 
     # In your TaskService class
