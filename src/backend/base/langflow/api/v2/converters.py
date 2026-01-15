@@ -495,7 +495,7 @@ def create_job_response(job_id: str) -> WorkflowJobResponse:
 
 def create_error_response(
     flow_id: str,
-    job_id: str,
+    job_id: str | None,
     workflow_request: WorkflowExecutionRequest,
     error: Exception,
 ) -> WorkflowExecutionResponse:

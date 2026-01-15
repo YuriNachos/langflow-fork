@@ -4,7 +4,7 @@ from __future__ import annotations
 
 from enum import Enum
 from typing import Any, Literal
-
+from datetime import datetime
 from pydantic import BaseModel, ConfigDict, Field
 
 
@@ -101,7 +101,7 @@ class WorkflowJobResponse(BaseModel):
     """Background job response."""
 
     job_id: str
-    created_timestamp: str
+    created_timestamp: str = Field(default_factory=lambda: datetime.now().isoformat())
     status: JobStatus
     errors: list[ErrorDetail] = []
 

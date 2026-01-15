@@ -36,6 +36,7 @@ from lfx.schema.workflow import (
     WorkflowJobResponse,
     WorkflowStopRequest,
     WorkflowStopResponse,
+    JobStatus,
 )
 from lfx.services.deps import get_settings_service
 
@@ -45,7 +46,8 @@ from langflow.api.v2.converters import (
     parse_flat_inputs,
     run_response_to_workflow_response,
 )
-from langflow.exceptions.api import WorkflowTimeoutError, WorkflowValidationError
+from lfx.log.logger import logger
+from langflow.services.deps import get_task_service
 from langflow.helpers.flow import get_flow_by_id_or_endpoint_name
 from langflow.processing.process import process_tweaks, run_graph_internal
 from langflow.services.auth.utils import api_key_security
@@ -79,157 +81,7 @@ def check_developer_api_enabled() -> None:
             },
         )
 
-
-router = APIRouter(prefix="/workflow", tags=["Workflow"], dependencies=[Depends(check_developer_api_enabled)])
-
-
-@router.post(
-    "",
-    response_model=None,
-    response_model_exclude_none=True,
-    responses=WORKFLOW_EXECUTION_RESPONSES,
-    summary="Execute Workflow",
-    description="Execute a workflow with support for sync, stream, and background modes",
-)
-async def execute_workflow(
-    workflow_request: WorkflowExecutionRequest,
-    background_tasks: BackgroundTasks,
-    api_key_user: Annotated[UserRead, Depends(api_key_security)],
-) -> WorkflowExecutionResponse | WorkflowJobResponse | StreamingResponse:
-    """Execute a workflow with support for multiple execution modes.
-
-    This endpoint supports three execution modes:
-        - **Synchronous** (background=False, stream=False): Returns complete results immediately
-        - **Streaming** (stream=True): Returns server-sent events in real-time (not yet implemented)
-        - **Background** (background=True): Starts job and returns job ID (not yet implemented)
-
-    Error Handling Strategy:
-        - System errors (404, 500, 503, 504): Returned as HTTP error responses
-        - Component execution errors: Returned as HTTP 200 with errors in response body
-
-    Args:
-        workflow_request: The workflow execution request containing flow_id, inputs, and mode flags
-        background_tasks: FastAPI background tasks for async operations
-        api_key_user: Authenticated user from API key
-
-    Returns:
-        - WorkflowExecutionResponse: For synchronous execution (HTTP 200)
-        - WorkflowJobResponse: For background execution (HTTP 202, not yet implemented)
-        - StreamingResponse: For streaming execution (not yet implemented)
-
-    Raises:
-        HTTPException:
-            - 403: Developer API disabled
-            - 404: Flow not found or user lacks access
-            - 500: Invalid flow data or validation error
-            - 501: Streaming or background mode not yet implemented
-            - 503: Database unavailable
-            - 504: Execution timeout exceeded
-    """
-    # Validate flow exists and user has permission
-    from pydantic_core import ValidationError as PydanticValidationError
-    from sqlalchemy.exc import OperationalError
-
-    try:
-        flow = await get_flow_by_id_or_endpoint_name(workflow_request.flow_id, api_key_user.id)
-    except HTTPException as e:
-        # get_flow_by_id_or_endpoint_name raises HTTPException with string detail
-        # Convert to structured format
-        if e.status_code == status.HTTP_404_NOT_FOUND:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail={
-                    "error": "Flow not found",
-                    "code": "FLOW_NOT_FOUND",
-                    "message": f"Flow '{workflow_request.flow_id}' does not exist or you don't have access to it",
-                    "flow_id": workflow_request.flow_id,
-                },
-            ) from e
-        # Re-raise other HTTPExceptions as-is
-        raise
-    except PydanticValidationError as e:
-        # Flow data validation errors (invalid flow structure)
-        error_msg = f"Flow has invalid data structure: {e!s}"
-        raise HTTPException(
-            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-            detail={
-                "error": "Invalid flow data",
-                "code": "INVALID_FLOW_DATA",
-                "message": error_msg,
-                "flow_id": workflow_request.flow_id,
-            },
-        ) from e
-    except OperationalError as e:
-        # Database errors specifically
-        error_msg = f"Failed to fetch flow: {e!s}"
-        raise HTTPException(
-            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
-            detail={
-                "error": "Service unavailable",
-                "code": "DATABASE_ERROR",
-                "message": error_msg,
-                "flow_id": workflow_request.flow_id,
-            },
-        ) from e
-
-    # Generate job_id for tracking
-    job_id = str(uuid4())
-
-    # Phase 1: Sync mode only (stream=false, background=false)
-    if not workflow_request.stream and not workflow_request.background:
-        try:
-            return await execute_sync_workflow_with_timeout(
-                workflow_request=workflow_request,
-                flow=flow,
-                job_id=job_id,
-                api_key_user=api_key_user,
-                background_tasks=background_tasks,
-            )
-        except WorkflowTimeoutError:
-            raise HTTPException(
-                status_code=status.HTTP_504_GATEWAY_TIMEOUT,
-                detail={
-                    "error": "Execution timeout",
-                    "code": "EXECUTION_TIMEOUT",
-                    "message": f"Workflow execution exceeded {EXECUTION_TIMEOUT} seconds",
-                    "job_id": job_id,
-                    "flow_id": workflow_request.flow_id,
-                    "timeout_seconds": EXECUTION_TIMEOUT,
-                },
-            ) from None
-        except WorkflowValidationError as e:
-            raise HTTPException(
-                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
-                detail={
-                    "error": "Workflow validation error",
-                    "code": "INVALID_FLOW_DATA",
-                    "message": str(e),
-                    "job_id": job_id,
-                    "flow_id": workflow_request.flow_id,
-                },
-            ) from e
-
-    # Phase 2: Background mode (to be implemented)
-    if workflow_request.background:
-        raise HTTPException(
-            status_code=status.HTTP_501_NOT_IMPLEMENTED,
-            detail={
-                "error": "Not implemented",
-                "code": "NOT_IMPLEMENTED",
-                "message": "Background execution not yet implemented",
-            },
-        )
-
-    # Phase 3: Streaming mode (to be implemented)
-    raise HTTPException(
-        status_code=status.HTTP_501_NOT_IMPLEMENTED,
-        detail={
-            "error": "Not implemented",
-            "code": "NOT_IMPLEMENTED",
-            "message": "Streaming execution not yet implemented",
-        },
-    )
-
+router = APIRouter(prefix="/workflows", tags=["Workflow"], dependencies=[Depends(check_developer_api_enabled)])
 
 async def execute_sync_workflow_with_timeout(
     workflow_request: WorkflowExecutionRequest,
@@ -365,6 +217,123 @@ async def execute_sync_workflow(
             workflow_request=workflow_request,
             error=exc,
         )
+
+
+async def execute_workflow_background(
+    workflow_request: WorkflowExecutionRequest,
+    flow: Flow,
+    job_id: str,
+    api_key_user: UserRead,
+    background_tasks: BackgroundTasks
+) -> WorkflowJobResponse:
+    """Execute workflow in the background and return job ID for the user to track the execution status."""
+    try:
+        # Parse flat inputs structure
+        tweaks, session_id = parse_flat_inputs(workflow_request.inputs or {})
+
+        # Validate flow data
+        if flow.data is None:
+            msg = f"Flow {flow.id} has no data"
+            raise ValueError(msg)
+
+        # Build the graph once
+        flow_id_str = str(flow.id)
+        user_id = str(api_key_user.id)
+        graph_data = flow.data.copy()
+        graph_data = process_tweaks(graph_data, tweaks, stream=False)
+        graph = Graph.from_payload(graph_data, flow_id=flow_id_str, user_id=user_id, flow_name=flow.name)
+        
+        # Get terminal nodes
+        terminal_node_ids = graph.get_terminal_nodes()
+
+        # Launch background task
+        task_service = get_task_service()
+
+        print("Task service: ", task_service)
+        print("Task service backend: ", task_service.backend)
+        job_id = await task_service.fire_and_forget_task(
+            run_graph_internal,
+            background_tasks,
+            graph=graph,
+            flow_id=flow_id_str,
+            session_id=session_id,
+            inputs=None,
+            outputs=terminal_node_ids,
+            stream=False,
+        )
+        status = JobStatus.QUEUED
+        return WorkflowJobResponse(
+            job_id=job_id,
+            status=status
+        )
+    
+    except Exception as exc:  # noqa: BLE001
+        return create_error_response(
+            flow_id=workflow_request.flow_id,
+            job_id=None,
+            workflow_request=workflow_request,
+            error=exc,
+        )
+
+
+@router.post(
+    "",
+    response_model=None,
+    response_model_exclude_none=True,
+    responses=WORKFLOW_EXECUTION_RESPONSES,
+    summary="Execute Workflow",
+    description="Execute a workflow with support for sync, stream, and background modes",
+)
+async def execute_workflow(
+    workflow_request: WorkflowExecutionRequest,
+    background_tasks: BackgroundTasks,
+    api_key_user: Annotated[UserRead, Depends(api_key_security)],
+) -> WorkflowExecutionResponse | WorkflowJobResponse | StreamingResponse:
+    """Execute a workflow with multiple execution modes.
+
+    - **sync**: Returns complete results immediately (background=False, stream=False)
+    - **stream**: Returns server-sent events in real-time (stream=True)
+    - **background**: Starts job and returns job ID immediately (background=True)
+    """
+    # Validate flow exists and user has permission
+    flow = await get_flow_by_id_or_endpoint_name(workflow_request.flow_id, api_key_user.id)
+    if not flow:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND, detail=f"Flow identifier {workflow_request.flow_id} not found"
+        )
+
+    # Phase 1: Sync mode only (stream=false, background=false)
+    if not workflow_request.stream and not workflow_request.background:
+        # Generate job_id for tracking
+        job_id = str(uuid4())
+        return await execute_sync_workflow(
+            workflow_request=workflow_request,
+            flow=flow,
+            job_id=job_id,
+            api_key_user=api_key_user,
+            background_tasks=background_tasks,
+        )
+
+    # Phase 2: Background mode (to be implemented)
+    if workflow_request.background:
+        try:
+            return await execute_workflow_background(
+                workflow_request=workflow_request,
+                flow=flow,
+                api_key_user=api_key_user,
+                background_tasks=background_tasks
+            )
+        except Exception as e:
+            print(e)
+            # logger.aerror("Failed to queue workflow task in background mode", exc_info=True)
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="An error occurred while starting the background task.",
+            )
+
+    # Phase 3: Streaming mode (to be implemented)
+    # This should never be reached due to the conditions above, but included for completeness
+    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Streaming execution not yet available.")
 
 
 @router.get(
