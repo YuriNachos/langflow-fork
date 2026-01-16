@@ -47,12 +47,23 @@ from langflow.api.v2.converters import (
     run_response_to_workflow_response,
 )
 from lfx.log.logger import logger
-from langflow.services.deps import get_task_service
+from langflow.services.deps import get_task_service, get_queue_service
 from langflow.helpers.flow import get_flow_by_id_or_endpoint_name
 from langflow.processing.process import process_tweaks, run_graph_internal
 from langflow.services.auth.utils import api_key_security
 from langflow.services.database.models.flow.model import FlowRead
 from langflow.services.database.models.user.model import UserRead
+from lfx.schema.workflow import (
+    WORKFLOW_EXECUTION_RESPONSES,
+    WORKFLOW_STATUS_RESPONSES,
+    WorkflowExecutionRequest,
+    WorkflowExecutionResponse,
+    WorkflowJobResponse,
+    WorkflowStopRequest,
+    WorkflowStopResponse,
+    JobStatus,
+    ErrorDetail
+)
 
 # Configuration constants
 EXECUTION_TIMEOUT = 300  # 5 minutes default timeout for sync execution
@@ -222,9 +233,7 @@ async def execute_sync_workflow(
 async def execute_workflow_background(
     workflow_request: WorkflowExecutionRequest,
     flow: Flow,
-    job_id: str,
-    api_key_user: UserRead,
-    background_tasks: BackgroundTasks
+    api_key_user: UserRead
 ) -> WorkflowJobResponse:
     """Execute workflow in the background and return job ID for the user to track the execution status."""
     try:
@@ -248,12 +257,8 @@ async def execute_workflow_background(
 
         # Launch background task
         task_service = get_task_service()
-
-        print("Task service: ", task_service)
-        print("Task service backend: ", task_service.backend)
         job_id = await task_service.fire_and_forget_task(
             run_graph_internal,
-            background_tasks,
             graph=graph,
             flow_id=flow_id_str,
             session_id=session_id,
@@ -320,8 +325,7 @@ async def execute_workflow(
             return await execute_workflow_background(
                 workflow_request=workflow_request,
                 flow=flow,
-                api_key_user=api_key_user,
-                background_tasks=background_tasks
+                api_key_user=api_key_user
             )
         except Exception as e:
             print(e)
@@ -346,35 +350,24 @@ async def execute_workflow(
 )
 async def get_workflow_status(
     api_key_user: Annotated[UserRead, Depends(api_key_security)],  # noqa: ARG001
-    job_id: Annotated[str, Query(description="Job ID to query")],  # noqa: ARG001
-) -> WorkflowExecutionResponse | StreamingResponse:
-    """Get workflow job status and results by job ID.
+    job_id: Annotated[str, Query(description="Job ID to query")],
+) -> WorkflowJobResponse:
+    """Get workflow job status and results by job ID."""
+    task_service = get_task_service()
+    
+    status_val = await task_service.get_task_status(job_id)
+    # Check if we have error info to return
+    errors = []
+    if status_val in [JobStatus.FAILED, JobStatus.ERROR]:
+        result = await task_service.get_task_result(job_id)
+        if isinstance(result, str):
+            errors.append(ErrorDetail(error=result, code=status_val.upper()))
 
-    This endpoint allows clients to poll for the status of background workflow executions.
-
-    Args:
-        api_key_user: Authenticated user from API key
-        job_id: The job ID returned from a background execution request
-
-    Returns:
-        - WorkflowExecutionResponse: If job is complete or failed
-        - StreamingResponse: If job is still running (for streaming mode)
-
-    Raises:
-        HTTPException:
-            - 403: Developer API disabled or unauthorized
-            - 404: Job ID not found
-            - 501: Not yet implemented
-
-    Note:
-        This endpoint is not yet implemented. It will be added in a future release
-        to support background and streaming execution modes.
-    """
-    # TODO: Implement job status tracking and retrieval
-    # - Store job metadata in database or cache
-    # - Track execution progress and status
-    # - Return appropriate response based on job state
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented /status yet")
+    return WorkflowJobResponse(
+        job_id=job_id,
+        status=status_val,
+        errors=errors
+    )
 
 
 @router.post(
@@ -384,38 +377,40 @@ async def get_workflow_status(
     description="Stop a running workflow execution",
 )
 async def stop_workflow(
-    request: WorkflowStopRequest,  # noqa: ARG001
+    request: WorkflowStopRequest,
     api_key_user: Annotated[UserRead, Depends(api_key_security)],  # noqa: ARG001
 ) -> WorkflowStopResponse:
-    """Stop a running workflow execution by job_id.
+    """Stop a running workflow execution by job_id."""
+    task_service = get_task_service()
+    
+    try:
+        # Check current status
+        current_status = await task_service.get_task_status(request.job_id)
+        
+        if current_status in [JobStatus.COMPLETED, JobStatus.FAILED]:
+            return WorkflowStopResponse(
+                job_id=request.job_id,
+                status="error",
+                message=f"Job {request.job_id} already finished with status {current_status}"
+            )
 
-    This endpoint allows clients to gracefully or forcefully stop a running workflow.
+        # Trigger cleanup/cancel
+        if not task_service.use_celery:
+            job_queue_service = get_queue_service()
+            await job_queue_service.cleanup_job(request.job_id)
+        else:
+            # Celery revoke logic
+            from langflow.worker import celery_app
+            celery_app.control.revoke(request.job_id, terminate=True)
 
-    Args:
-        request: Stop request containing job_id and optional force flag
-        api_key_user: Authenticated user from API key
-
-    Returns:
-        WorkflowStopResponse: Confirmation of stop request with final job status
-
-    Raises:
-        HTTPException:
-            - 403: Developer API disabled or unauthorized
-            - 404: Job ID not found
-            - 409: Job already completed or cannot be stopped
-            - 501: Not yet implemented
-
-    Note:
-        This endpoint is not yet implemented. It will be added in a future release
-        to support graceful cancellation of background and streaming executions.
-
-        Planned behavior:
-        - force=False: Graceful shutdown (complete current component)
-        - force=True: Immediate termination
-    """
-    # TODO: Implement workflow cancellation
-    # - Locate running job by job_id
-    # - Send cancellation signal to execution engine
-    # - Handle graceful vs forced termination
-    # - Update job status and return response
-    raise HTTPException(status_code=status.HTTP_501_NOT_IMPLEMENTED, detail="Not implemented /stop yet")
+        return WorkflowStopResponse(
+            job_id=request.job_id,
+            status="stopped",
+            message=f"Stop request sent for job {request.job_id}"
+        )
+    except Exception as e:
+        return WorkflowStopResponse(
+            job_id=request.job_id,
+            status="error",
+            message=str(e)
+        )

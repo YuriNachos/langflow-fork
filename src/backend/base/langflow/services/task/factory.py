@@ -11,5 +11,4 @@ class TaskServiceFactory(ServiceFactory):
 
     @override
     def create(self, settings_service: SettingsService):
-        print(settings_service)
         return TaskService(settings_service)

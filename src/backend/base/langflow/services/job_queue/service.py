@@ -4,6 +4,7 @@ import asyncio
 
 from lfx.log.logger import logger
 
+from lfx.schema.workflow import JobStatus
 from langflow.events.event_manager import EventManager
 from langflow.services.base import Service
 
@@ -173,27 +174,44 @@ class JobQueueService(Service):
             logger.error(msg)
             raise RuntimeError(msg)
 
-        main_queue, event_manager, existing_task, _ = self._queues[job_id]
+        job_entry = self._queues[job_id]
 
-        if existing_task and not existing_task.done():
+        if job_entry["task"] and not job_entry["task"].done():
             logger.debug(f"Existing task for job_id {job_id} detected; cancelling it.")
-            existing_task.cancel()
+            job_entry["task"].cancel()
 
         # Initiate the new asynchronous task.
-        task = asyncio.create_task(task_coro)
-        self._queues[job_id] = (main_queue, event_manager, task, None)
+        async def task_wrapper(coro):
+            self._queues[job_id]["status"] = JobStatus.IN_PROGRESS
+            try:
+                result = await coro
+                self._queues[job_id]["status"] = JobStatus.COMPLETED
+                self._queues[job_id]["result"] = result
+                # Mark for cleanup after completion
+                self._queues[job_id]["cleanup_time"] = asyncio.get_running_loop().time()
+            except asyncio.CancelledError:
+                self._queues[job_id]["status"] = JobStatus.ERROR
+                self._queues[job_id]["error"] = "Task was cancelled"
+                raise
+            except Exception as e:
+                self._queues[job_id]["status"] = JobStatus.FAILED
+                self._queues[job_id]["error"] = str(e)
+                # Mark for cleanup after failure
+                self._queues[job_id]["cleanup_time"] = asyncio.get_running_loop().time()
+                raise
+
+        task = asyncio.create_task(task_wrapper(task_coro))
+        job_entry["task"] = task
         logger.debug(f"New task started for job_id {job_id}")
 
-    def get_queue_data(self, job_id: str) -> tuple[asyncio.Queue, EventManager, asyncio.Task | None, float | None]:
+    def get_queue_data(self, job_id: str) -> dict[str, Any]:
         """Retrieve the complete data structure associated with a job's queue.
 
         Args:
             job_id (str): Unique identifier for the job.
 
         Returns:
-            tuple[asyncio.Queue, EventManager, asyncio.Task | None, float | None]:
-                A tuple containing the job's main queue, its linked event manager, the associated task (if any),
-                and the cleanup timestamp (if any).
+            dict[str, Any]: The internal job record including queue, status, result, etc.
 
         Raises:
             JobQueueNotFoundError: If the job_id is not found.
@@ -224,17 +242,20 @@ class JobQueueService(Service):
             await logger.adebug(f"No queue found for job_id {job_id} during cleanup.")
             return
 
-        await logger.adebug(f"Commencing cleanup for job_id {job_id}")
-        main_queue, _event_manager, task, _ = self._queues[job_id]
+        job_entry = self._queues[job_id]
+        main_queue = job_entry["queue"]
+        task = job_entry["task"]
 
         # Cancel the associated task if it is still running.
         if task and not task.done():
             await logger.adebug(f"Cancelling active task for job_id {job_id}")
             task.cancel()
-            await asyncio.wait([task])
-            # Log any exceptions that occurred during the task's execution.
-            if exc := task.exception():
-                await logger.aerror(f"Error in task for job_id {job_id}: {exc}")
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                await logger.aerror(f"Error during task cancellation for {job_id}: {e}")
             await logger.adebug(f"Task cancellation complete for job_id {job_id}")
 
         # Clear the queue since we just cancelled the task or it has completed
@@ -276,31 +297,16 @@ class JobQueueService(Service):
         current_time = asyncio.get_running_loop().time()
 
         for job_id in list(self._queues.keys()):
-            _, _, task, cleanup_time = self._queues[job_id]
+            job_entry = self._queues[job_id]
+            task = job_entry["task"]
+            cleanup_time = job_entry["cleanup_time"]
+            
             if task:
-                await logger.adebug(
-                    f"Queue {job_id} status - Done: {task.done()}, "
-                    f"Cancelled: {task.cancelled()}, "
-                    f"Has exception: {task.exception() is not None if task.done() else 'N/A'}"
-                )
-
-                # Check if task should be marked for cleanup
-                if task and (task.cancelled() or (task.done() and task.exception() is not None)):
-                    if cleanup_time is None:
-                        # Mark for cleanup by setting the timestamp
-                        self._queues[job_id] = (
-                            self._queues[job_id][0],
-                            self._queues[job_id][1],
-                            self._queues[job_id][2],
-                            current_time,
-                        )
-                        await logger.adebug(
-                            f"Job queue for job_id {job_id} marked for cleanup - Task cancelled or failed"
-                        )
-                    elif current_time - cleanup_time >= self.CLEANUP_GRACE_PERIOD:
-                        # Enough time has passed, perform the actual cleanup
-                        await logger.adebug(f"Cleaning up job_id {job_id} after grace period")
-                        await self.cleanup_job(job_id)
+                # Check if task should be marked for cleanup (though now we mark in the wrapper)
+                if cleanup_time is not None and current_time - cleanup_time >= self.CLEANUP_GRACE_PERIOD:
+                    # Enough time has passed, perform the actual cleanup
+                    await logger.adebug(f"Cleaning up job_id {job_id} after grace period")
+                    await self.cleanup_job(job_id)
 
     def _create_default_event_manager(self, queue: asyncio.Queue) -> EventManager:
         """Creates the default event manager with predefined events.

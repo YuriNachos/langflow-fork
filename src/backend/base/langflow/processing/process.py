@@ -49,6 +49,7 @@ async def run_graph_internal(
 
     fallback_to_env_vars = get_settings_service().settings.fallback_to_env_var
     graph.session_id = effective_session_id
+    print("Effective session ID: ", effective_session_id)
     run_outputs = await graph.arun(
         inputs=inputs_list,
         inputs_components=components,

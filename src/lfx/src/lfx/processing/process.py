@@ -74,6 +74,7 @@ async def run_graph_internal(
         fallback_to_env_vars = False
 
     graph.session_id = effective_session_id
+    print("Effective session ID: ", effective_session_id)
     run_outputs = await graph.arun(
         inputs=inputs_list,
         inputs_components=components,
@@ -84,6 +85,7 @@ async def run_graph_internal(
         fallback_to_env_vars=fallback_to_env_vars,
         event_manager=event_manager,
     )
+    print("Run outputs: ", run_outputs)
     return run_outputs, effective_session_id
 
 
